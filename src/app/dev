@@ -1,0 +1,461 @@
+#!/bin/bash
+
+################################################################################
+# COMMAND OPTIONS
+################################################################################
+
+commands=(
+  "init"
+  "up"
+  "down"
+  "storybook_init"
+  "storybook"
+  "node_deps"
+  "python_deps"
+  "deploy_test"
+  "migrate_dbs"
+  "r_up"
+  "r_down"
+  "auth_db"
+  "init_db"
+  "rebuild_images"
+  "rebuild_volumes"
+  "nuke"
+  "quit"
+)
+
+################################################################################
+# COMMAND DESCRIPTIONS
+################################################################################
+
+
+descriptions=(
+  "Initialize development environment"
+  "Launch development environment"
+  "Terminate development environment"
+  "An alias for 'npm install'. A local 'node_modules' is required to allow local storybook to run"
+  "Launch the storybook environment"
+  "Update node dependencies"
+  "Update python dependencies"
+  "Deploy release-candy to test.4cinsights.com"
+  "Run alembic migrations"
+  "Launch development environment for remote debugging"
+  "Terminate remote debugging development environment"
+  "Reload Auth DB"
+  "Reset all MariaDB databases"
+  "Rebuild service images"
+  "Rebuild data volumes"
+  "Remove all docker containers, volumes, and images"
+  "Quit"
+)
+
+################################################################################
+# COMMAND IMPLEMENTATIONS
+################################################################################
+
+init () {
+  if docker images |grep -q voxsup_dev ; then
+    prompt 'You seem to have already run init. Are you sure you want to do it again?'
+  else
+    true
+  fi
+  if [ "$?" -eq 0 ] ; then
+    rebuild_images
+    populate_volumes
+    echo -e "\nDone initializing dev environment."
+  fi
+}
+
+up () {
+  check_for_updates
+  echo "Bringing up development environment with ${EXTS-all} ext(s)..."
+  compose "up"
+}
+
+down () {
+  echo "Shutting down development environment..."
+  compose "down"
+}
+
+node_deps () {
+  echo "Updating node dependencies..."
+  run_voxsup_dev dockerfiles/dev_env/build_frontend_deps.bash
+  hash_package_json
+}
+
+python_deps () {
+  echo "Updating python dependencies..."
+  run_voxsup_dev -c "pip install --user -r requirements.txt"
+}
+
+deploy_test () {
+  run_voxsup_dev -c "fab deploy_test"
+}
+
+migrate_dbs () {
+  echo "Running DB migrations..."
+  run_voxsup_dev -c "cd db_versioning && alembic upgrade head"
+}
+
+
+r_up () {
+  COMPOSE_FILE="$(pycharm_cfg)" up
+}
+
+r_down () {
+  COMPOSE_FILE="$(pycharm_cfg)" down
+}
+
+auth_db () {
+  if prompt "Are you sure you want to replace your local Auth DB?" ; then
+    do_auth_db
+  fi
+}
+
+init_db () {
+  if prompt "Are you sure you want to initialize (drop and recreate) your local MariaDB databases?" ; then
+    do_init_db
+  fi
+}
+
+rebuild_images () {
+  if build_prereqs ; then
+    echo "Building images..."
+    compose "build" --no-cache
+  fi
+}
+
+rebuild_volumes () {
+  if build_prereqs ; then
+    echo "Rebuilding volumes..."
+    down
+    r_down
+    docker volume prune -f
+    populate_volumes
+  fi
+}
+
+nuke () {
+  if prompt "Are you sure you want to remove all docker containers, images, and volumes?" ; then
+    echo "Cleaning up..."
+    RUNNING="$(docker container ls -q)"
+    if ! [ -z "${RUNNING}" ] ; then
+      docker container stop ${RUNNING}
+    fi
+    docker container prune -f
+    docker system prune -f -a
+    docker volume prune -f
+  fi
+}
+
+quit () {
+  echo 'Bye.'
+  exit 0
+}
+
+################################################################################
+# UTILITIES
+################################################################################
+
+compose () {
+  if run_prereqs ; then
+    docker-compose "${@:1}"
+    return "$?"
+  fi
+}
+
+run () {
+  compose "run" "${@:1}"
+  return "$?"
+}
+
+run_voxsup_dev () {
+  run --rm voxsup_dev bash "${@:1}"
+  return "$?"
+}
+
+exec () {
+  compose "exec" "${@:1}"
+  return "$?"
+}
+
+exec_voxsup_dev () {
+  exec voxsup_dev bash "${@:1}"
+  return "$?"
+}
+
+tunnel () {
+  local args=( ssh -4 -oStrictHostKeyChecking=no "${@:1}" -N )
+  exec_voxsup_dev -c "${args[*]}"
+}
+
+prompt () {
+  while true; do
+      read -p "${1} [y/N] " yn
+      case $yn in
+          [Yy]* ) return 0;;
+          * ) return 1;;
+      esac
+  done
+}
+
+do_auth_db () {
+  echo "Reloading auth DB..."
+  run_voxsup_dev -c "dockerfiles/dev_env/load_latest_auth_dump.bash"
+  return "$?"
+}
+
+do_init_db () {
+  echo "Initializing MariaDB databases..."
+  run_voxsup_dev dockerfiles/dev_env/init_db.bash
+  return "$?"
+}
+
+populate_volumes () {
+  node_deps
+  python_deps
+  do_init_db
+  do_auth_db
+}
+
+is_windows_host () {
+  grep -q Microsoft /proc/version > /dev/null 2>&1
+  return "$?"
+}
+
+PREREQ_PASS="\033[32m\xE2\x9C\x94\033[39m"
+PREREQ_FAIL="\033[31m\xE2\x9C\x97\033[39m"
+
+check_for_updates () {
+  if [ ! -f ../../node_modules/_packagejson.md5 ]; then
+    echo "File not found!"
+    hash_package_json
+  fi
+
+  file='../../node_modules/_packagejson.md5'
+  while IFS= read line
+  do
+    cachedHash="$line"
+  done <"$file"
+
+  mkdir -p ../../node_modules
+  if type md5 > /dev/null; then
+    hashed=($(md5 -r ../../package.json))
+  else
+    hashed=($(md5sum ../../package.json))
+  fi
+
+  if [ ! $hashed == $cachedHash ]; then
+    if prompt "Package.json has changed. Would you like to update Node dependencies?" ; then
+      node_deps
+    fi
+  fi
+}
+
+hash_package_json() {
+  if type md5 > /dev/null; then
+    md5 -r ../../package.json | cut -c -32 > ../../node_modules/_packagejson.md5
+  else
+    md5sum ../../package.json | cut -c -32 > ../../node_modules/_packagejson.md5
+  fi
+
+}
+
+common_prereqs () {
+  local status=0
+
+  # check for SSH key
+  ssh_keyfile="${COMPOSE_ENV_SSH_DIR-$(read_default COMPOSE_ENV_SSH_DIR)}/id_rsa"
+  if [ ! -f ${ssh_keyfile} ] ; then
+    status=1
+    echo -e "${PREREQ_FAIL} SSH key not found."
+  elif [ $1 == "yes" ]; then
+    echo -e "${PREREQ_PASS} Found SSH key at ${ssh_keyfile}"
+  fi
+
+  # check if LOGNAME environment variable is set
+  if is_windows_host; then
+    ENV_LOGNAME=`cmd.exe /c "echo %LOGNAME%"`
+    if [[ "$ENV_LOGNAME" == *"%LOGNAME%"* ]]; then
+      ENV_LOGNAME=""
+    fi
+  else
+    ENV_LOGNAME="$LOGNAME"
+  fi
+  if [ -z "$ENV_LOGNAME" ] ; then
+    status=1
+    echo -e "${PREREQ_FAIL} LOGNAME environment variable not set."
+  elif [ $1 == "yes" ]; then
+    echo -e "${PREREQ_PASS} Found LOGNAME=$ENV_LOGNAME"
+  fi
+
+  # check if docker is installed and running
+  if ! command -v docker > /dev/null; then
+    status=1
+    echo -e "${PREREQ_FAIL} Docker not found. Is it installed?"
+  elif ! docker ps > /dev/null 2>&1 ; then
+    status=1
+    echo -e "${PREREQ_FAIL} Docker not running. Start it before continuing."
+  elif [ $1 == "yes" ]; then
+    echo -e "${PREREQ_PASS} Found docker at $(command -v docker)"
+  fi
+
+  # check if docker-compose is installed
+  if ! command -v docker-compose > /dev/null; then
+    status=1
+    echo -e "${PREREQ_FAIL} Docker Compose not found. Is it installed?"
+  elif [ $1 == "yes" ]; then
+    echo -e "${PREREQ_PASS} Found docker-compose at $(command -v docker-compose)"
+  fi
+
+  return $status
+}
+
+run_prereqs () {
+  local status=0
+
+  # check for local.4cinsights.com redirect in /etc/hosts
+  if ! grep -q "^127\.0\.0\.1[[:blank:]]\+local\.4cinsights\.com[[:blank:]]*$" /etc/hosts ; then
+    status=1
+    echo -e "${PREREQ_FAIL} local.4cinsights.com redirect not set."
+  fi
+
+  # check for local.voxsupinc.com redirect in /etc/hosts
+  if ! grep -q "^127\.0\.0\.1[[:blank:]]\+local\.voxsupinc\.com[[:blank:]]*$" /etc/hosts ; then
+    status=1
+    echo -e "${PREREQ_FAIL} local.voxsupinc.com redirect not set."
+  fi
+
+  # check for correct config.py linkage
+  if ! [ -e ../../server/config.py ] ; then
+    status=1
+    echo -e "${PREREQ_FAIL} server/config.py does not exist. It should link to server/config_docker_dev.py or your own custom config file."
+  fi
+
+  if ! common_prereqs "no" ; then
+    status=1
+  fi
+
+  return $status
+}
+
+build_prereqs () {
+  echo "Checking prerequisites..."
+  common_prereqs "yes"
+  return $?
+}
+
+storybook_init () {
+  if prompt "Are you sure you want to run 'npm install'? This can take >600mb of space" ; then
+    `npm install`
+    echo "Installation complete"
+  fi
+}
+
+storybook () {
+  `npm run storybook`
+}
+
+format_option () {
+  printf "%-16s - %s" "$1" "$2"
+}
+
+pycharm_cfg () {
+  local SEPARATOR=":"
+  if is_windows_host; then
+    SEPARATOR=";"
+  fi
+  echo "docker-compose.yml${SEPARATOR}docker-compose.pycharm.yml"
+}
+
+read_default () {
+  source ./.env
+  echo "${!1}"
+}
+
+unset command_options
+for index in ${!commands[@]}; do
+  option=$(format_option "${commands[$index]}" "${descriptions[$index]}")
+  command_options+=("$option")
+done
+
+print_usage () {
+  printf "\nUsage: $0 [OPTIONS] [COMMAND]\n"
+  printf "\nA script for managing the 4C Docker Development Environment\n"
+  printf "\nOptions:\n"
+  printf "  $(format_option '--help' 'Show usage')\n"
+  printf "\nCommands:\n"
+  for opt in "${command_options[@]}"; do
+    printf "  %s\n" "${opt}"
+  done
+  printf "  $(format_option 'run ARGS' 'Run a command in a new voxsup_dev container')\n"
+  printf "  $(format_option 'exec ARGS' 'Run a command in the running voxsup_dev container')\n"
+  printf "  $(format_option 'tunnel host ARGS' 'Create an SSH tunnel in the running service container')\n"
+  printf "\n"
+}
+
+################################################################################
+# MAIN SCRIPT
+################################################################################
+
+main () {
+  if [ $1 == 'run' ]; then
+    run_voxsup_dev "${@:2}"
+  elif [ $1 == 'exec' ]; then
+    exec_voxsup_dev "${@:2}"
+  elif [ $# -gt 1 ]; then
+    if [ $1 == 'tunnel' ]; then
+      tunnel "${@:2}"
+    else
+      print_usage
+      exit 1
+    fi
+  elif [ $# -eq 1 ]; then
+    if [ $1 == '--help' ]; then
+      print_usage
+      exit 0
+    else
+      for cmd in ${commands[@]}; do
+        if [ $1 == "$cmd" ]; then
+          $cmd "${@:2}"
+          exit 0
+        fi
+      done
+      print_usage
+      exit 1
+    fi
+  else
+    printf "\n4C Docker Development Environment\n\n"
+    COLUMNS=1
+    PS3=$'\n'">>> "
+    select opt in "${command_options[@]}"
+    do
+      unset cmd
+      if [[ "$REPLY" =~ ^[0-9]+$ ]]; then
+        cmd=${commands["${REPLY}" - 1]}
+      else
+        for c in ${commands[@]}; do
+          if [ $REPLY == "$c" ]; then
+            cmd="$c"
+            break
+          fi
+        done
+      fi
+      if [ -z "$cmd" ]; then
+        echo "Invalid option."
+      else
+        $cmd
+        exit 0
+      fi
+    done
+  fi
+}
+
+################################################################################
+# ENTRY
+################################################################################
+
+cd "${0%/*}"
+set -e
+
+main "$@"
